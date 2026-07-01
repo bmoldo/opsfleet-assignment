@@ -2,7 +2,7 @@ import os
 
 from diagrams import Cluster, Diagram, Edge
 from diagrams.aws.compute import ECR, EKS, EC2
-from diagrams.aws.database import Aurora
+from diagrams.aws.database import RDS, Aurora
 from diagrams.aws.management import Cloudwatch
 from diagrams.aws.network import ELB, CloudFront, NATGateway, Route53
 from diagrams.aws.security import KMS, WAF, SecretsManager, Shield
@@ -49,13 +49,15 @@ with Diagram(
 
         with Cluster("Private app subnets — Amazon EKS"):
             eks = EKS("EKS control plane")
-            sys_ng = EC2("System node group\n(managed, on-demand)")
+            sys_ng = EC2("System node group\n(managed, on-demand)\nruns Karpenter")
             karp = EC2("Karpenter nodes\nGraviton + Spot\n(Flask API pods)")
-            eks >> Edge(style="dashed", label="provisions") >> karp
+            sys_ng >> Edge(style="dashed", label="Karpenter\nprovisions") >> karp
 
         with Cluster("Private data subnets"):
+            proxy = RDS("RDS Proxy\n(connection pooling)")
             db_w = Aurora("Aurora PostgreSQL\nwriter (Multi-AZ)")
             db_r = Aurora("Aurora\nread replica")
+            proxy >> db_w
             db_w >> Edge(label="sync/async\nreplication") >> db_r
 
     with Cluster("Platform & security services"):
@@ -74,7 +76,8 @@ with Diagram(
     cdn >> Edge(label="/api  (HTTPS)") >> alb
     alb >> Edge(label="app traffic") >> karp
 
-    karp >> Edge(label="SQL / TLS") >> db_w
+    karp >> Edge(label="SQL / TLS") >> proxy
+    karp >> Edge(style="dotted", label="egress", constraint="false") >> nat
     karp >> Edge(style="dotted") >> secrets
     karp >> Edge(style="dotted", label="pull") >> ecr
     karp >> Edge(style="dotted") >> cw

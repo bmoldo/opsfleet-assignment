@@ -6,8 +6,9 @@ This repository contains both deliverables for the assignment.
 
 Terraform that deploys a dedicated VPC and the latest Amazon EKS cluster, with
 **Karpenter** provisioning **both x86 (amd64) and Graviton (arm64)** nodes on
-**Spot** (On-Demand fallback). Includes a runnable demo showing a developer
-scheduling a pod on either architecture with a one-line `nodeSelector`.
+**Spot and On-Demand** capacity. Includes a runnable demo showing a developer
+scheduling a pod on either architecture with a one-line `nodeSelector` — or a
+single command: `make apply ENV=dev OS=arm|x86`.
 
 → **[terraform/README.md](./terraform/README.md)**
 

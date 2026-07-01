@@ -70,8 +70,10 @@ alternative and the same principles map across.)
 
 ![Innovate Inc. production AWS architecture](./diagram.png)
 
-> Rendered from [`generate_diagram.py`](./generate_diagram.py) (Python `diagrams`
-> + Graphviz). A Mermaid version is below so it renders even without the image.
+> Rendered from [`generate_diagram.py`](./generate_diagram.py). To regenerate:
+> `pip install diagrams` (needs the system Graphviz `dot` binary), then
+> `python generate_diagram.py` — it writes `diagram.png` next to the script.
+> A Mermaid version is below so it renders even without the image.
 
 ```mermaid
 flowchart TB
@@ -83,15 +85,18 @@ flowchart TB
 
     subgraph VPC["Prod account — VPC (3 AZs)"]
       subgraph app["Private app subnets — Amazon EKS"]
-        ng["System node group<br/>(managed, on-demand)"]
+        ng["System node group<br/>(managed, on-demand)<br/>runs the Karpenter controller"]
         kp["Karpenter nodes<br/>Graviton + Spot<br/>(Flask API pods)"]
+        ng -.->|provisions| kp
       end
       subgraph data["Private data subnets"]
+        proxy["RDS Proxy<br/>(connection pooling)"]
         aur["Aurora PostgreSQL<br/>writer (Multi-AZ)"]
         aurr["Aurora read replica"]
       end
       alb --> kp
-      kp -->|SQL / TLS via RDS Proxy| aur
+      kp -->|SQL / TLS| proxy
+      proxy --> aur
       aur -.->|replication| aurr
     end
 
@@ -177,8 +182,10 @@ tiers** so trust boundaries map onto the network:
 | **Private — app** | EKS nodes & pods (Flask API)               | Egress only, via NAT      |
 | **Private — data**| Aurora, ElastiCache (future), RDS Proxy    | **No internet route**     |
 
-Example CIDR plan (`10.0.0.0/16` per environment, non-overlapping across
-environments so they can be peered/transit-gateway'd later):
+Each environment gets its **own /16** — e.g. Dev `10.10.0.0/16`, Prod
+`10.20.0.0/16`, matching the [`terraform/`](../terraform) tfvars — so CIDRs never
+overlap and the VPCs can be peered/transit-gateway'd later. Example layout
+within one environment's /16 (shown for `10.0.0.0/16`):
 
 | Subnet        | AZ-a         | AZ-b         | AZ-c         |
 | ------------- | ------------ | ------------ | ------------ |
@@ -187,6 +194,11 @@ environments so they can be peered/transit-gateway'd later):
 | Private data /24 | 10.0.52.0/24 | 10.0.53.0/24 | 10.0.54.0/24 |
 
 Large `/20` app subnets give the VPC CNI plenty of pod IP space.
+
+> **Note vs. the POC:** the [`terraform/`](../terraform) POC uses the
+> `x.x.52–54.0/24` range as *intra* subnets for the EKS control-plane ENIs (it
+> deploys no database). In this target design that range is the private-data
+> tier; the control-plane ENIs get their own small subnets alongside it.
 
 ### Securing the network — defense in depth
 
