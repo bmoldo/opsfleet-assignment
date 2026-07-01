@@ -27,3 +27,14 @@ variable "vpc_cidr" {
   type        = string
   default     = "10.0.0.0/16"
 }
+
+variable "demo_archs" {
+  description = "Architectures for the optional demo workload (set via `make ... OS=arm|x86` or `CONCURRENT=1` for both). Empty deploys no demo workload."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for a in var.demo_archs : contains(["amd64", "arm64"], a)])
+    error_message = "demo_archs may only contain \"amd64\" and \"arm64\"."
+  }
+}

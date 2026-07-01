@@ -2,11 +2,6 @@ data "aws_ecrpublic_authorization_token" "token" {
   provider = aws.virginia
 }
 
-# Creates everything Karpenter needs on the AWS side:
-#   - the controller IAM role + EKS Pod Identity association (v21 default),
-#   - the node IAM role, instance profile permissions, and an EKS access entry
-#     so Karpenter-launched nodes are allowed to join the cluster,
-#   - the SQS queue + EventBridge rules for Spot interruption / rebalance events.
 module "karpenter" {
   source  = "terraform-aws-modules/eks/aws//modules/karpenter"
   version = "~> 21.0"
@@ -24,9 +19,6 @@ module "karpenter" {
   tags = local.tags
 }
 
-# Karpenter controller. Pinned to a version that supports the chosen Kubernetes
-# version (see var.karpenter_version). Scheduled onto the system node group and
-# uses dnsPolicy: Default so it does not depend on in-cluster CoreDNS to start.
 resource "helm_release" "karpenter" {
   namespace  = "kube-system"
   name       = "karpenter"
@@ -37,8 +29,6 @@ resource "helm_release" "karpenter" {
   repository_username = data.aws_ecrpublic_authorization_token.token.user_name
   repository_password = data.aws_ecrpublic_authorization_token.token.password
 
-  # CRDs are installed by the chart; we don't need to block on controller
-  # readiness because the CRs below apply server-side and reconcile once it's up.
   wait = false
 
   values = [
@@ -56,15 +46,6 @@ resource "helm_release" "karpenter" {
   ]
 }
 
-# The chart installs Karpenter's CRDs on first install; give the API server a
-# moment to register them before we apply the NodePool / EC2NodeClass CRs.
-resource "time_sleep" "wait_for_karpenter_crds" {
-  create_duration = "30s"
-  depends_on      = [helm_release.karpenter]
-}
-
-# EC2NodeClass: the AWS-level launch template Karpenter uses for nodes.
-# AL2023, node IAM role from the module, and subnet/SG discovery by tag.
 resource "kubectl_manifest" "karpenter_node_class" {
   yaml_body = <<-YAML
     apiVersion: karpenter.k8s.aws/v1
@@ -85,14 +66,9 @@ resource "kubectl_manifest" "karpenter_node_class" {
         karpenter.sh/discovery: ${local.name}
   YAML
 
-  depends_on = [time_sleep.wait_for_karpenter_crds]
+  depends_on = [helm_release.karpenter]
 }
 
-# A single, flexible NodePool that can launch BOTH x86 (amd64) and Graviton
-# (arm64) nodes, on Spot with On-Demand as fallback. Developers steer workloads
-# to an architecture / capacity type with pod nodeSelectors (see examples/).
-# Karpenter picks the cheapest instance that satisfies a pod's constraints, so
-# Spot + Graviton are chosen by default when a pod allows them.
 resource "kubectl_manifest" "karpenter_node_pool" {
   yaml_body = <<-YAML
     apiVersion: karpenter.sh/v1

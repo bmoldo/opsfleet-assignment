@@ -1,4 +1,3 @@
-# Discover AZs that don't require opt-in, then pin the deployment to the first 3.
 data "aws_availability_zones" "available" {
   filter {
     name   = "opt-in-status"
@@ -13,6 +12,6 @@ locals {
   tags = {
     Project   = "opsfleet-eks-karpenter"
     ManagedBy = "terraform"
-    Env       = "poc"
+    Env       = terraform.workspace
   }
 }

@@ -1,8 +1,3 @@
-# x86 (amd64) workload on Spot.
-#
-# The "amd64" nodeSelector can't be satisfied by the arm64 system nodes, so
-# Karpenter provisions a dedicated amd64 Spot node. Swap the image for your own
-# x86 build to see it schedule here.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -24,7 +19,7 @@ spec:
         karpenter.sh/capacity-type: spot
       containers:
         - name: app
-          image: public.ecr.aws/nginx/nginx:latest # multi-arch (amd64 + arm64)
+          image: public.ecr.aws/nginx/nginx:latest
           ports:
             - containerPort: 80
           resources:

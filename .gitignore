@@ -13,8 +13,9 @@ override.tf.json
 .terraformrc
 terraform.rc
 
-# Keep the dependency lock file committed
+# Keep the dependency lock file and per-environment tfvars committed
 !**/.terraform.lock.hcl
+!**/environments/*.tfvars
 
 # ---- Python (architecture diagram generation) ----
 __pycache__/

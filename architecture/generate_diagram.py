@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""Generate the High-Level Diagram (HLD) for Innovate Inc.'s AWS architecture.
-
-Usage:
-    pip install diagrams   # also requires the system Graphviz `dot` binary
-    python generate_diagram.py
-Produces `diagram.png` next to this script.
-"""
 import os
 
 from diagrams import Cluster, Diagram, Edge
@@ -77,13 +69,11 @@ with Diagram(
         ga = GithubActions("GitHub Actions\nbuild + scan\n(multi-arch)")
         argo = ArgoCD("Argo CD")
 
-    # Request path
     users >> dns >> cdn
     cdn >> Edge(label="static") >> spa
     cdn >> Edge(label="/api  (HTTPS)") >> alb
     alb >> Edge(label="app traffic") >> karp
 
-    # Runtime dependencies
     karp >> Edge(label="SQL / TLS") >> db_w
     karp >> Edge(style="dotted") >> secrets
     karp >> Edge(style="dotted", label="pull") >> ecr
@@ -91,7 +81,6 @@ with Diagram(
     db_w >> Edge(style="dotted", label="encrypt at rest") >> kms
     secrets >> Edge(style="dotted") >> kms
 
-    # Delivery path
     gh >> ga >> Edge(label="push image") >> ecr
     ga >> Edge(label="bump tag") >> argo
     argo >> Edge(label="sync / deploy") >> eks
