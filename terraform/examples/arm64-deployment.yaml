@@ -1,0 +1,34 @@
+# Graviton (arm64) workload on Spot.
+#
+# The two nodeSelectors ("arm64" + "spot") cannot be satisfied by the on-demand
+# Graviton *system* nodes, so Karpenter provisions a dedicated arm64 Spot node —
+# demonstrating "Graviton + Spot" in one shot. The image is multi-arch, so it
+# runs natively on arm64.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-graviton
+  labels:
+    app: hello-graviton
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hello-graviton
+  template:
+    metadata:
+      labels:
+        app: hello-graviton
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: arm64
+        karpenter.sh/capacity-type: spot
+      containers:
+        - name: app
+          image: public.ecr.aws/nginx/nginx:latest # multi-arch (amd64 + arm64)
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
