@@ -70,47 +70,6 @@ alternative and the same principles map across.)
 
 ![Innovate Inc. production AWS architecture](./diagram.png)
 
-> Rendered from [`generate_diagram.py`](./generate_diagram.py). To regenerate:
-> `pip install diagrams` (needs the system Graphviz `dot` binary), then
-> `python generate_diagram.py` — it writes `diagram.png` next to the script.
-> A Mermaid version is below so it renders even without the image.
-
-```mermaid
-flowchart TB
-    users(("End users"))
-    users --> r53["Route 53"]
-    r53 --> cf["CloudFront<br/>+ WAF + Shield"]
-    cf -->|static assets| s3["S3 — React SPA"]
-    cf -->|/api HTTPS| alb["Application Load Balancer<br/>(public subnets)"]
-
-    subgraph VPC["Prod account — VPC (3 AZs)"]
-      subgraph app["Private app subnets — Amazon EKS"]
-        ng["System node group<br/>(managed, on-demand)<br/>runs the Karpenter controller"]
-        kp["Karpenter nodes<br/>Graviton + Spot<br/>(Flask API pods)"]
-        ng -.->|provisions| kp
-      end
-      subgraph data["Private data subnets"]
-        proxy["RDS Proxy<br/>(connection pooling)"]
-        aur["Aurora PostgreSQL<br/>writer (Multi-AZ)"]
-        aurr["Aurora read replica"]
-      end
-      alb --> kp
-      kp -->|SQL / TLS| proxy
-      proxy --> aur
-      aur -.->|replication| aurr
-    end
-
-    kp -.-> sm["Secrets Manager"]
-    kp -.->|pull images| ecr["ECR"]
-    kp -.-> cw["CloudWatch / Prometheus"]
-    aur -.->|encrypt at rest| kms["KMS"]
-
-    gh["GitHub"] --> ga["GitHub Actions<br/>build + scan (multi-arch)"]
-    ga -->|push image| ecr
-    ga -->|bump tag| argo["Argo CD"]
-    argo -->|sync / deploy| app
-```
-
 ---
 
 ## 4. Cloud environment structure (AWS accounts)
