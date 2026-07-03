@@ -77,36 +77,15 @@ alternative and the same principles map across.)
 **Recommendation: AWS Organizations governed by AWS Control Tower**, with a
 small set of purpose-built accounts organized into Organizational Units (OUs).
 
-```mermaid
-flowchart TD
-    Root["AWS Organization<br/>Management account<br/>(consolidated billing, SCPs, Control Tower)"]
-    Root --> SecOU
-    Root --> InfraOU
-    Root --> WorkOU
-
-    subgraph SecOU["Security OU"]
-      Log["Log Archive account<br/>central CloudTrail / Config / flow logs"]
-      Audit["Audit account<br/>GuardDuty, Security Hub, IAM Access Analyzer"]
-    end
-    subgraph InfraOU["Infrastructure OU"]
-      Shared["Shared Services account<br/>CI/CD, shared ECR, Route 53, Transit Gateway"]
-    end
-    subgraph WorkOU["Workloads OU"]
-      Dev["Dev account"]
-      Prod["Prod account"]
-      Stg["Staging account<br/>(added as needed)"]
-    end
-```
-
-| Account            | Purpose                                                                                     | Why separate                                                 |
-| ------------------ | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| **Management**     | Org root: consolidated billing, Service Control Policies (SCPs), Control Tower. **No workloads.** | Blast-radius: the most privileged account holds nothing to attack. |
-| **Log Archive**    | Immutable, central sink for CloudTrail, Config, and VPC flow logs.                          | Tamper-evident audit trail even if a workload account is compromised. |
-| **Audit / Security** | Aggregates GuardDuty, Security Hub, Access Analyzer; home for the security team's read access. | Central threat detection, separation of duties.             |
-| **Shared Services**| CI/CD runners, a shared/promoted ECR, central DNS, (later) Transit Gateway.                 | Shared platform tooling used by all environments.           |
-| **Dev**            | Non-prod experimentation and PR/preview environments.                                        | Freedom to break things without touching prod.              |
-| **Prod**           | Customer-facing workload + production data.                                                  | Strongest controls, tightest access, separate billing.      |
-| **Staging** *(later)* | Prod-like pre-production validation.                                                      | Add when release risk justifies a full mirror.              |
+| Account            | OU             | Purpose                                                                                     | Why separate                                                 |
+| ------------------ | -------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| **Management**     | Org root       | Consolidated billing, Service Control Policies (SCPs), Control Tower. **No workloads.**    | Blast-radius: the most privileged account holds nothing to attack. |
+| **Log Archive**    | Security       | Immutable, central sink for CloudTrail, Config, and VPC flow logs.                          | Tamper-evident audit trail even if a workload account is compromised. |
+| **Audit / Security** | Security     | Aggregates GuardDuty, Security Hub, Access Analyzer; home for the security team's read access. | Central threat detection, separation of duties.             |
+| **Shared Services**| Infrastructure | CI/CD runners, a shared/promoted ECR, central DNS, (later) Transit Gateway.                 | Shared platform tooling used by all environments.           |
+| **Dev**            | Workloads      | Non-prod experimentation and PR/preview environments.                                        | Freedom to break things without touching prod.              |
+| **Prod**           | Workloads      | Customer-facing workload + production data.                                                  | Strongest controls, tightest access, separate billing.      |
+| **Staging** *(later)* | Workloads   | Prod-like pre-production validation.                                                      | Add when release risk justifies a full mirror.              |
 
 **Why multiple accounts (not one account + namespaces)?**
 
