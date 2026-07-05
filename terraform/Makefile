@@ -83,13 +83,13 @@ plan: _guard-env _guard-os _check-auth _workspace
 	else \
 		echo "Cluster not in state yet — planning the infra phase (VPC + EKS) only."; \
 		echo "Kubernetes-level resources (Karpenter, demo) plan after the first apply."; \
-		$(TF) plan -target=module.eks $(TF_VARS); \
+		$(TF) plan -target=module.vpc -target=module.eks $(TF_VARS); \
 	fi
 
 apply: _guard-env _guard-os _check-auth _bootstrap _workspace
 	@if ! $(_cluster-in-state); then \
 		echo "First apply for this env: creating VPC + EKS before the Kubernetes add-ons (two-phase bootstrap)..."; \
-		$(TF) apply -target=module.eks $(TF_VARS) || exit 1; \
+		$(TF) apply -target=module.vpc -target=module.eks $(TF_VARS) || exit 1; \
 	fi
 	$(TF) apply $(TF_VARS)
 
