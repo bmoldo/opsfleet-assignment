@@ -3,6 +3,8 @@
 # - Every PR and push touching terraform/**: fmt check + validate (no AWS needed).
 # - PRs additionally get a `terraform plan` for dev, posted to the job log.
 # - Push to master: auto-deploys to dev via `make apply ENV=dev`.
+# - Manual run (workflow_dispatch): same deploy, plus an OS dropdown to launch
+#   the demo workload on arm, x86, or both (Karpenter provisions the capacity).
 #
 # AWS auth is GitHub OIDC (no long-lived keys). The plan/deploy jobs are
 # skipped until the one-time bootstrap is done and the AWS_ROLE_ARN repository
@@ -19,6 +21,17 @@ on:
     paths:
       - "terraform/**"
       - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "Demo workload architecture (Karpenter launches matching Spot capacity)"
+        type: choice
+        default: "none"
+        options:
+          - none
+          - arm
+          - x86
+          - both
 
 permissions:
   id-token: write # OIDC token for aws-actions/configure-aws-credentials
@@ -69,7 +82,7 @@ jobs:
         run: make plan ENV=dev
 
   deploy-dev:
-    if: github.event_name == 'push' && vars.AWS_ROLE_ARN != ''
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.AWS_ROLE_ARN != ''
     needs: checks
     runs-on: ubuntu-latest
     environment: dev
@@ -83,7 +96,17 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      # Manual runs pick the demo architecture from the dropdown; pushes
+      # deploy with no demo args (same semantics as `make apply ENV=dev`,
+      # which also removes a previously-deployed demo workload).
       - name: terraform apply (dev)
-        run: make apply ENV=dev
+        run: |
+          ARGS=""
+          case "${OS_CHOICE}" in
+            arm|x86) ARGS="OS=${OS_CHOICE}" ;;
+            both)    ARGS="CONCURRENT=1" ;;
+          esac
+          make apply ENV=dev ${ARGS}
         env:
           TF_CLI_ARGS_apply: "-auto-approve"
+          OS_CHOICE: ${{ inputs.os }}

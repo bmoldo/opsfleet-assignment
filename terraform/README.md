@@ -270,6 +270,7 @@ the module changes in this directory into GitHub Actions:
 | PR / push touching `terraform/**` | `terraform fmt -check` + `make validate` (no AWS)   |
 | PR (once OIDC is bootstrapped) | `make plan ENV=dev` — review the diff in the job log   |
 | Push to `master`               | `make apply ENV=dev` — **auto-deploys to dev**         |
+| Manual run (Actions → terraform → Run workflow) | Same deploy, with an **OS dropdown** (`none`/`arm`/`x86`/`both`) that deploys the demo workload on the chosen architecture(s) |
 
 Auth uses **GitHub OIDC** (short-lived credentials, no stored keys). The
 plan/deploy jobs **skip themselves until the `AWS_ROLE_ARN` repository
