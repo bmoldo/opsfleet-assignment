@@ -93,8 +93,18 @@ apply: _guard-env _guard-os _check-auth _bootstrap _workspace
 	fi
 	$(TF) apply $(TF_VARS)
 
+# If a previous destroy already removed the cluster but failed later (e.g. a
+# lingering ENI), the kubectl/helm providers can no longer configure and a
+# plain retry errors out — fall back to a targeted destroy of the AWS-only
+# leftovers in that case.
 destroy: _guard-env _check-auth _workspace
-	$(TF) destroy -var-file=$(TFVARS)
+	@if $(_cluster-in-state); then \
+		echo "$(TF) destroy -var-file=$(TFVARS)"; \
+		$(TF) destroy -var-file=$(TFVARS); \
+	else \
+		echo "Cluster not in state — destroying remaining VPC/EKS leftovers via targeted destroy."; \
+		$(TF) destroy -target=module.vpc -target=module.eks -var-file=$(TFVARS); \
+	fi
 
 destroy-demo: _guard-env _guard-os _check-auth _workspace
 	$(TF) destroy -target='$(DEMO_TARGET)' -var-file=$(TFVARS)
