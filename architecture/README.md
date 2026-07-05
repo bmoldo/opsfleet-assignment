@@ -31,12 +31,12 @@ data), cost-effective, managed Kubernetes, CI/CD.
 | **Network**   | One VPC per workload account, 3 AZs, three subnet tiers (public / private-app / private-data). Private nodes & DB, edge protected by CloudFront + WAF + Shield, private connectivity via VPC endpoints. |
 | **Compute**   | **Amazon EKS** with a small managed system node group + **Karpenter** for workloads on **Graviton + Spot**. HPA for pods, Karpenter for nodes. GitOps delivery with Argo CD. |
 | **Containers**| Multi-stage, **multi-arch** images built in CI, stored in **ECR** (scan-on-push, immutable tags), deployed via Argo CD. |
-| **Database**  | **Amazon Aurora PostgreSQL** (Multi-AZ), **RDS Proxy** for pooling, PITR backups, **Aurora Global Database** for cross-region DR. |
+| **Database**  | **Amazon Aurora PostgreSQL** (multi-AZ cluster), **RDS Proxy** for pooling, PITR backups, **Aurora Global Database** for cross-region DR. |
 | **Secrets**   | AWS Secrets Manager + KMS, mounted via IRSA / Pod Identity; automatic rotation. |
 
-The design deliberately **starts small and cheap** (single NAT paths, minimal
-always-on compute, low DB instance sizes) while every layer has a **documented,
-low-friction scaling path** to millions of users.
+The design deliberately **starts small and cheap** (single NAT in non-prod,
+minimal always-on compute, low DB instance sizes) while every layer has a
+**documented, low-friction scaling path** to millions of users.
 
 ---
 
@@ -68,7 +68,66 @@ alternative and the same principles map across.)
 
 ## 3. High-level architecture diagram
 
-![Innovate Inc. production AWS architecture](./diagram.png)
+```mermaid
+flowchart TB
+    U["End users"]
+    R53["Route 53<br/>(DNS resolution only)"]
+    CF["CloudFront<br/>WAF + Shield at edge"]
+    S3["S3 bucket (regional)<br/>React SPA static assets"]
+
+    U -. "DNS" .-> R53
+    U --> CF
+    CF -- "static assets" --> S3
+    CF -- "/api (HTTPS)" --> ALB
+
+    subgraph VPC["Prod VPC — 3 availability zones"]
+        subgraph PUB["Public subnets"]
+            ALB["ALB<br/>SG: CloudFront prefix list only"]
+            NAT["NAT gateways<br/>one per AZ (x3)"]
+        end
+        subgraph APP["Private app subnets — EKS data plane"]
+            ARGO["Argo CD (in-cluster)"]
+            PODS["Flask API pods<br/>Karpenter: Graviton + Spot"]
+            VPCE["VPC endpoints<br/>ECR, S3, Secrets Manager, logs"]
+        end
+        subgraph DATA["Private data subnets"]
+            PROXY["RDS Proxy<br/>r/w + read-only endpoints"]
+            W["Aurora writer (AZ-a)"]
+            RD["Aurora reader (AZ-b)<br/>failover target"]
+            ST[("Shared storage<br/>6 copies / 3 AZs / KMS")]
+        end
+    end
+
+    ALB --> PODS
+    PODS -- "writes (TLS)" --> PROXY
+    PODS -- "reads (TLS)" --> PROXY
+    PROXY -- "writes" --> W
+    PROXY -- "reads" --> RD
+    W --- ST
+    RD --- ST
+
+    DEV["Developer"] -- "push" --> GH["GitHub<br/>app + manifests repos"]
+    GH -- "triggers" --> GHA["GitHub Actions<br/>build, test, scan"]
+    GHA -- "push multi-arch image" --> ECR["ECR<br/>scan-on-push, immutable tags"]
+    GHA -- "commit new tag to manifests" --> GH
+    ARGO -- "pull desired state" --> GH
+    ARGO -- "sync" --> PODS
+    PODS -. "pull images via VPC endpoint" .-> ECR
+```
+
+Key properties the diagram encodes deliberately:
+
+- **Route 53 is DNS-only** — it never carries traffic; users connect to CloudFront.
+- **S3 is a regional CloudFront origin**, not an edge component.
+- **The ALB only accepts the CloudFront managed prefix list**, so WAF cannot be
+  bypassed by hitting the ALB directly.
+- **GitOps is pull-based**: CI never talks to the cluster. Actions pushes the
+  image and commits the tag back to Git; Argo CD (running inside EKS) pulls.
+- **Aurora has exactly one writer** (single AZ); HA comes from the shared
+  storage layer (6 copies across 3 AZs) plus reader promotion — there is no
+  instance-to-instance replication stream between writer and reader.
+- The **EKS control plane is not drawn inside the VPC** — it runs in an
+  AWS-managed VPC and attaches ENIs into the private subnets.
 
 ---
 
@@ -85,7 +144,7 @@ small set of purpose-built accounts organized into Organizational Units (OUs).
 | **Shared Services**| Infrastructure | CI/CD runners, a shared/promoted ECR, central DNS, (later) Transit Gateway.                 | Shared platform tooling used by all environments.           |
 | **Dev**            | Workloads      | Non-prod experimentation and PR/preview environments.                                        | Freedom to break things without touching prod.              |
 | **Prod**           | Workloads      | Customer-facing workload + production data.                                                  | Strongest controls, tightest access, separate billing.      |
-| **Staging** *(later)* | Workloads   | Prod-like pre-production validation.                                                      | Add when release risk justifies a full mirror.              |
+| **Staging** *(later)* | Workloads   | Prod-like pre-production validation.                                                      | Add when release risk justifies a full mirror.               |
 
 **Why multiple accounts (not one account + namespaces)?**
 
@@ -149,21 +208,27 @@ Large `/20` app subnets give the VPC CNI plenty of pod IP space.
   if the risk profile warrants.
 
 **Ingress into the VPC**
-- Only the **ALB** in public subnets is internet-reachable. It's provisioned by
-  the **AWS Load Balancer Controller** from Kubernetes `Ingress` objects.
+- Only the **ALB** in public subnets is internet-reachable, and its security
+  group admits **only the CloudFront managed prefix list** (optionally verified
+  with a custom origin header) — the edge WAF cannot be bypassed by hitting the
+  ALB directly.
+- The ALB is provisioned by the **AWS Load Balancer Controller** from Kubernetes
+  `Ingress` objects.
 - Nodes and the database are in **private subnets** — never directly exposed.
 - The **EKS API endpoint is private** (or public but locked to office/VPN CIDRs).
 
 **Egress & private connectivity**
-- **NAT gateways** (one per AZ in prod for HA) for outbound from private subnets.
+- **NAT gateways** (one per AZ in prod for HA; a single NAT is acceptable in
+  non-prod as a cost trade-off) for outbound from private subnets.
 - **VPC endpoints** for S3 (gateway), ECR, STS, Secrets Manager, CloudWatch, etc.
   — keeps AWS-service traffic on the AWS backbone (**more secure and cuts NAT
   data-processing cost**).
 
 **Inside the VPC / cluster**
-- **Security groups** as the primary, stateful, least-privilege firewall — e.g.
-  the Aurora SG only accepts 5432 from the node/RDS-Proxy SG. NACLs as a coarse
-  secondary layer.
+- **Security groups** as the primary, stateful, least-privilege firewall:
+  the **Aurora SG accepts 5432 only from the RDS Proxy SG**, and the
+  **RDS Proxy SG accepts 5432 only from the EKS node/pod SG**. NACLs as a
+  coarse secondary layer.
 - **Kubernetes NetworkPolicies** (VPC CNI network policy or Cilium) for
   pod-to-pod segmentation (e.g. only the API may reach the DB egress path).
 - **VPC Flow Logs** → Log Archive account for forensics.
@@ -177,7 +242,9 @@ Large `/20` app subnets give the VPC CNI plenty of pod IP space.
 
 Managed control plane (multi-AZ, patched, 99.95% SLA), deep AWS integration
 (IAM, VPC CNI, Load Balancer Controller, EBS/EFS CSI), and a portable,
-standards-based Kubernetes API the team can hire for.
+standards-based Kubernetes API the team can hire for. The control plane runs in
+an **AWS-managed VPC** and attaches ENIs into our private subnets — we never
+operate or patch it.
 
 ### Cluster & node strategy
 
@@ -226,11 +293,14 @@ A **two-layer** node design (this is exactly the pattern implemented in the
   (`linux/amd64,linux/arm64`)** so the *same* image runs on x86 or Graviton — a
   prerequisite for the Graviton/Spot savings above.
 - **Registry** — **Amazon ECR** (private): **scan-on-push** (or Inspector),
-  **immutable tags**, and **lifecycle policies** to expire old images. Optionally
+  **immutable tags**, and **lifecycle policies** to expire old images. Nodes
+  pull images over the **ECR VPC endpoints**, not the NAT path. Optionally
   **cosign** image signing + a Kyverno policy that only admits signed images.
-- **Deployment** — **GitOps with Argo CD**: CI pushes the image and bumps the tag
-  in a Git config repo; Argo CD reconciles the cluster to Git. Benefits: auditable
-  history, trivial rollback (`git revert`), and no cluster-admin creds in CI.
+- **Deployment** — **GitOps with Argo CD, pull-based**: CI pushes the image to
+  ECR and commits the new tag to the Git config repo; **Argo CD, running inside
+  the cluster, pulls from Git** and reconciles the cluster to the declared
+  state. CI never talks to the cluster. Benefits: auditable history, trivial
+  rollback (`git revert`), and no cluster-admin creds in CI.
   **Argo Rollouts** adds canary/blue-green with automated metric-based rollback.
 - **Pod → AWS access** via **EKS Pod Identity / IRSA** — each workload assumes a
   narrowly-scoped IAM role (e.g. read one Secrets Manager secret), never node
@@ -245,13 +315,13 @@ A **two-layer** node design (this is exactly the pattern implemented in the
 **Aurora PostgreSQL** (PostgreSQL-compatible) is recommended over self-managed
 PostgreSQL on EC2 and, for this growth profile, over plain RDS PostgreSQL:
 
-| Capability                | Aurora PostgreSQL                              | RDS PostgreSQL                | Self-managed on EC2 |
-| ------------------------- | ---------------------------------------------- | ----------------------------- | ------------------- |
-| Storage                   | Auto-grows to 128 TiB, 6 copies across 3 AZs   | Provisioned, manual grow      | You manage disks    |
-| Read scaling              | Up to **15 low-lag reader replicas**           | Up to 5 read replicas         | DIY                 |
-| Failover                  | Typically **< 30 s** to a reader               | 60–120 s (Multi-AZ)           | DIY                 |
-| Cross-region DR           | **Global Database** (RPO ~1 s)                 | Cross-region read replica     | DIY                 |
-| Ops burden                | Fully managed                                  | Fully managed                 | High                |
+| Capability                | Aurora PostgreSQL                              | RDS PostgreSQL                          | Self-managed on EC2 |
+| ------------------------- | ---------------------------------------------- | --------------------------------------- | ------------------- |
+| Storage                   | Auto-grows to 128 TiB, 6 copies across 3 AZs   | Provisioned, manual grow                | You manage disks    |
+| Read scaling              | Up to 15 replicas on **shared storage, typically ms-level lag** | Up to 15 replicas via **async WAL streaming, lag varies with write load** | DIY |
+| Failover                  | Typically **< 30 s** to a reader               | 60–120 s (Multi-AZ instance); ~35 s (Multi-AZ DB cluster) | DIY |
+| Cross-region DR           | **Global Database** (RPO ~1 s)                 | Cross-region read replica               | DIY                 |
+| Ops burden                | Fully managed                                  | Fully managed                           | High                |
 
 Self-managed Postgres is explicitly **not** recommended — it puts backups, HA,
 patching, and failover on a small team for no benefit. If absolute cost at tiny
@@ -260,19 +330,27 @@ point with a clean upgrade path to Aurora; the design below assumes Aurora.
 
 ### Topology & connection management
 
-- **Writer + reader(s)** across AZs. The app uses the **cluster (writer)
-  endpoint** for writes and the **reader endpoint** for read-heavy queries.
+- **One writer + reader(s) across AZs.** Aurora has exactly one writer instance
+  at a time; readers serve reads and act as failover targets.
 - **Amazon RDS Proxy** sits between the pods and Aurora to **pool and multiplex
   connections** — important because a horizontally-scaled Flask fleet can open
-  many connections, and RDS Proxy also **speeds up failover** transparently.
-- Runs in the **private data subnets**; its security group accepts 5432 **only**
-  from the node / RDS-Proxy security groups.
+  many connections — and it **speeds up failover** transparently. The app
+  connects **only to the proxy**: the **proxy's default (read/write) endpoint**
+  for writes and its **read-only endpoint** for read-heavy queries. The proxy
+  targets the Aurora cluster endpoints internally.
+- Runs in the **private data subnets**; Aurora accepts 5432 only from the proxy
+  SG, and the proxy accepts 5432 only from the EKS node/pod SG.
 
 ### High availability
 
-- **Multi-AZ** by design — Aurora's storage is replicated 6 ways across 3 AZs.
+- **Multi-AZ at the cluster level** — Aurora's storage is replicated 6 ways
+  across 3 AZs; instances (writer, readers) are placed in different AZs. Note
+  the writer itself is a single instance in a single AZ — HA comes from the
+  storage layer plus reader promotion, not from a "multi-AZ writer".
+- Readers share the **same storage volume** as the writer — there is no
+  instance-to-instance replication stream to lag or break.
 - Automatic failover promotes a reader on writer failure (typically < 30 s).
-- Reader endpoint load-balances read traffic across replicas.
+- The proxy's read-only endpoint load-balances read traffic across replicas.
 
 ### Backups
 
@@ -291,7 +369,7 @@ point with a clean upgrade path to Aurora; the design below assumes Aurora.
 
 | Scenario            | Mechanism                              | RPO      | RTO         |
 | ------------------- | -------------------------------------- | -------- | ----------- |
-| AZ failure          | Multi-AZ auto-failover                 | ~0       | < 30 s      |
+| AZ failure          | Reader promotion (shared storage)      | ~0       | < 30 s      |
 | Accidental delete / bad migration | PITR restore             | ≤ 5 min  | minutes     |
 | Region failure      | Global Database promotion              | ~1 s     | < 1 min (DB) + app failover |
 
@@ -318,15 +396,16 @@ Developer → GitHub PR → GitHub Actions
    ├─ push to ECR (immutable tag = git SHA)
    └─ open PR bumping the image tag in the GitOps config repo
                                    │
-                          Argo CD reconciles ──► EKS (dev → staging → prod)
+              Argo CD (in-cluster) pulls Git ──► reconciles EKS (dev → staging → prod)
                                    └─ Argo Rollouts: canary + auto-rollback on bad metrics
 ```
 
 - **Separation of concerns:** the app repo builds artifacts; a **config repo**
   (Kustomize/Helm) declares desired state per environment. Promotion = a Git
   change, reviewed and merged.
-- **No standing cluster credentials in CI** — Argo CD pulls from Git, shrinking
-  the attack surface.
+- **Pull-based, not push-based:** CI's job ends at Git. **No standing cluster
+  credentials in CI** — Argo CD pulls from Git from inside the cluster,
+  shrinking the attack surface.
 - **Rollback** is `git revert`; **release history** is the Git log.
 
 ---
@@ -339,9 +418,10 @@ Developer → GitHub PR → GitHub Actions
   you pay for actual demand, not a padded static fleet.
 - **SPA on S3 + CloudFront** instead of running it in pods — cheap, fast, scales
   infinitely.
-- **VPC endpoints** cut NAT data-processing charges for AWS-service traffic.
-- **Right-sized start:** small Aurora instance, single-NAT in non-prod, scale up
-  as metrics demand.
+- **VPC endpoints** cut NAT data-processing charges for AWS-service traffic
+  (image pulls are the big one).
+- **Right-sized start:** small Aurora instance, single-NAT in non-prod (per-AZ
+  NAT in prod), scale up as metrics demand.
 - **Governance:** Cost Explorer, budgets/alerts, per-account and per-tag
   attribution; Compute Savings Plans once steady-state on-demand usage is known.
 
@@ -366,8 +446,8 @@ Developer → GitHub PR → GitHub Actions
 
 | Stage | Users | What changes |
 | ----- | ----- | ------------ |
-| **Launch** | 100s/day | Single region; small Aurora writer + 1 reader; Karpenter min footprint; single-NAT in non-prod. |
-| **Traction** | 10k–100k | Add Aurora readers + route reads via reader endpoint; HPA thresholds tuned; multi-NAT in prod; add Staging account; caching (ElastiCache/Redis) + CloudFront API caching. |
+| **Launch** | 100s/day | Single region; small Aurora writer + 1 reader; Karpenter min footprint; single-NAT in non-prod (per-AZ NAT in prod from day one). |
+| **Traction** | 10k–100k | Add Aurora readers + route reads via the proxy's read-only endpoint; HPA thresholds tuned; add Staging account; caching (ElastiCache/Redis) + CloudFront API caching. |
 | **Scale** | 1M+ | Aurora Global Database (multi-region DR / read-local); shard or offload hot paths; per-service namespaces/teams; Shield Advanced; SLOs + error budgets; FinOps with Savings Plans. |
 
 **Nothing in the launch design has to be thrown away to get to scale** — the

@@ -1,12 +1,11 @@
 import os
 
 from diagrams import Cluster, Diagram, Edge
-from diagrams.aws.compute import ECR, EKS, EC2
+from diagrams.aws.compute import ECR, EC2
 from diagrams.aws.database import RDS, Aurora
-from diagrams.aws.management import Cloudwatch
-from diagrams.aws.network import ELB, CloudFront, NATGateway, Route53
-from diagrams.aws.security import KMS, WAF, SecretsManager, Shield
+from diagrams.aws.network import ELB, CloudFront, Endpoint, NATGateway, Route53
 from diagrams.aws.storage import S3
+from diagrams.generic.storage import Storage
 from diagrams.onprem.ci import GithubActions
 from diagrams.onprem.client import Users
 from diagrams.onprem.gitops import ArgoCD
@@ -18,7 +17,6 @@ OUTFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diagram")
 USER_TRAFFIC = {"color": "#1f6feb", "penwidth": "2.2"}          # solid blue
 DATA_PATH = {"color": "#8250df", "penwidth": "2.2"}             # solid purple
 CICD = {"color": "#1a7f37", "penwidth": "2.0"}                  # solid green
-PROVISION = {"color": "#d4a72c", "style": "dashed", "penwidth": "2.0"}
 SUPPORT = {"color": "#57606a", "style": "dotted", "penwidth": "1.6"}
 
 graph_attr = {
@@ -45,69 +43,62 @@ with Diagram(
     edge_attr=edge_attr,
 ):
     users = Users("End users")
+    dns = Route53("Route 53\n(DNS resolution only)")
+    cdn = CloudFront("CloudFront\nWAF + Shield at edge")
+    spa = S3("S3 bucket (regional)\nReact SPA static assets")
 
-    with Cluster("Edge (global)"):
-        dns = Route53("Route 53")
-        cdn = CloudFront("CloudFront")
-        waf = WAF("WAF")
-        shield = Shield("Shield")
-        spa = S3("React SPA\n(static assets)")
-        # invisible edges pin WAF/Shield onto CloudFront's rank, right beside it
-        dns >> Edge(style="invis") >> waf
-        dns >> Edge(style="invis") >> shield
-        cdn - Edge(constraint="false", **SUPPORT) - waf
-        waf - Edge(constraint="false", **SUPPORT) - shield
+    with Cluster("CI/CD (GitOps, pull-based)"):
+        dev = Users("Developer")
+        gh = Github("GitHub\n(app + manifests repos)")
+        ga = GithubActions("GitHub Actions\nbuild, test, scan\n(multi-arch)")
+        ecr = ECR("ECR\nscan-on-push,\nimmutable tags")
 
-    with Cluster("CI/CD (GitOps)"):
-        gh = Github("GitHub\n(app + manifests)")
-        ga = GithubActions("GitHub Actions\nbuild + scan\n(multi-arch)")
-        argo = ArgoCD("Argo CD")
-
-    with Cluster("Prod account — dedicated VPC (3 Availability Zones)"):
+    # EKS control plane lives in an AWS-managed VPC (ENIs attach into the
+    # private subnets) — deliberately drawn outside the workload VPC.
+    with Cluster("Prod VPC — 3 Availability Zones"):
         with Cluster("Public subnets"):
-            alb = ELB("Application\nLoad Balancer")
-            nat = NATGateway("NAT gateway\n(egress for\nprivate subnets)")
+            alb = ELB("ALB\nSG: CloudFront\nprefix list only")
+            nat = NATGateway("NAT gateways\none per AZ (x3)")
 
-        with Cluster("Private app subnets — Amazon EKS"):
-            eks = EKS("EKS control plane")
+        with Cluster("Private app subnets — EKS data plane"):
+            argo = ArgoCD("Argo CD\n(in-cluster)")
+            pods = EC2("Flask API pods\nKarpenter:\nGraviton + Spot")
             sys_ng = EC2("System node group\n(managed, on-demand)\nruns Karpenter")
-            karp = EC2("Karpenter nodes\nGraviton + Spot\n(Flask API pods)")
+            vpce = Endpoint("VPC endpoints\nECR, S3, Secrets\nManager, logs")
 
         with Cluster("Private data subnets"):
-            proxy = RDS("RDS Proxy\n(connection pooling)")
-            db_w = Aurora("Aurora PostgreSQL\nwriter (Multi-AZ)")
-            db_r = Aurora("Aurora\nread replica")
-
-    with Cluster("Platform & security services"):
-        ecr = ECR("ECR\n(container images)")
-        secrets = SecretsManager("Secrets\nManager")
-        kms = KMS("KMS")
-        cw = Cloudwatch("CloudWatch\n+ Container Insights")
+            proxy = RDS("RDS Proxy\nr/w + read-only\nendpoints")
+            db_w = Aurora("Aurora writer\n(AZ-a)")
+            db_r = Aurora("Aurora reader (AZ-b)\nfailover target")
+            storage = Storage("Shared storage\n6 copies / 3 AZs / KMS")
 
     # ---- User traffic (blue) ------------------------------------------------
-    users >> Edge(**USER_TRAFFIC) >> dns >> Edge(**USER_TRAFFIC) >> cdn
+    users >> Edge(label="DNS", style="dashed", color="#1f6feb") >> dns
+    users >> Edge(**USER_TRAFFIC) >> cdn
     cdn >> Edge(label="static assets", **USER_TRAFFIC) >> spa
-    cdn >> Edge(label="/api (HTTPS)", decorate="true", **USER_TRAFFIC) >> alb
-    alb >> Edge(label="app traffic", **USER_TRAFFIC) >> karp
+    cdn >> Edge(label="/api (HTTPS)", **USER_TRAFFIC) >> alb
+    alb >> Edge(label="app traffic", **USER_TRAFFIC) >> pods
 
     # ---- Data path (purple) -------------------------------------------------
-    karp >> Edge(label="SQL / TLS", **DATA_PATH) >> proxy
-    proxy >> Edge(**DATA_PATH) >> db_w
-    db_w >> Edge(label="replication", style="dashed", color="#8250df") >> db_r
+    pods >> Edge(label="reads + writes (TLS)", **DATA_PATH) >> proxy
+    proxy >> Edge(label="writes", **DATA_PATH) >> db_w
+    proxy >> Edge(label="reads", **DATA_PATH) >> db_r
+    # No writer→reader replication stream: both instances share the storage volume.
+    db_w - Edge(**SUPPORT) - storage
+    db_r - Edge(**SUPPORT) - storage
 
-    # ---- Node provisioning (dashed yellow) ----------------------------------
-    sys_ng >> Edge(label="provisions", **PROVISION) >> karp
+    # ---- Node provisioning / egress (dotted gray) ---------------------------
+    sys_ng >> Edge(label="provisions", style="dashed", color="#d4a72c",
+                   penwidth="2.0") >> pods
+    pods >> Edge(label="egress", constraint="false", **SUPPORT) >> nat
+    pods >> Edge(label="pull images via\nVPC endpoint", constraint="false",
+                 **SUPPORT) >> vpce
+    vpce >> Edge(constraint="false", **SUPPORT) >> ecr
 
-    # ---- Supporting services (dotted gray) ----------------------------------
-    karp >> Edge(label="egress", constraint="false", **SUPPORT) >> nat
-    karp >> Edge(label="secrets", **SUPPORT) >> secrets
-    karp >> Edge(label="pull images", **SUPPORT) >> ecr
-    karp >> Edge(label="metrics / logs", **SUPPORT) >> cw
-    db_w >> Edge(label="encrypt at rest", constraint="false", **SUPPORT) >> kms
-    secrets >> Edge(**SUPPORT) >> kms
-
-    # ---- CI/CD (green) ------------------------------------------------------
-    gh >> Edge(**CICD) >> ga
-    ga >> Edge(label="push image", **CICD) >> ecr
-    ga >> Edge(label="bump tag", **CICD) >> argo
-    argo >> Edge(label="sync / deploy", **CICD) >> eks
+    # ---- CI/CD (green) — CI never talks to the cluster ----------------------
+    dev >> Edge(label="push", **CICD) >> gh
+    gh >> Edge(label="triggers", **CICD) >> ga
+    ga >> Edge(label="push multi-arch image", **CICD) >> ecr
+    ga >> Edge(label="commit new tag\nto manifests", **CICD) >> gh
+    argo >> Edge(label="pull desired state", **CICD) >> gh
+    argo >> Edge(label="sync", **CICD) >> pods
