@@ -68,6 +68,12 @@ alternative and the same principles map across.)
 
 ## 3. High-level architecture diagram
 
+![Innovate Inc. production AWS architecture](./diagram.drawio.svg)
+
+*(The SVG is a draw.io export with the source embedded — open it in
+[draw.io](https://app.diagrams.net) to edit. The Mermaid version below mirrors
+it for text-based review.)*
+
 ```mermaid
 flowchart TB
     U["End users"]
