@@ -71,55 +71,7 @@ alternative and the same principles map across.)
 ![Innovate Inc. production AWS architecture](./diagram.drawio.svg)
 
 *(The SVG is a draw.io export with the source embedded — open it in
-[draw.io](https://app.diagrams.net) to edit. The Mermaid version below mirrors
-it for text-based review.)*
-
-```mermaid
-flowchart TB
-    U["End users"]
-    R53["Route 53<br/>(DNS resolution only)"]
-    CF["CloudFront<br/>WAF + Shield at edge"]
-    S3["S3 bucket (regional)<br/>React SPA static assets"]
-
-    U -. "DNS" .-> R53
-    U --> CF
-    CF -- "static assets" --> S3
-    CF -- "/api (HTTPS)" --> ALB
-
-    subgraph VPC["Prod VPC — 3 availability zones"]
-        subgraph PUB["Public subnets"]
-            ALB["ALB<br/>SG: CloudFront prefix list only"]
-            NAT["NAT gateways<br/>one per AZ (x3)"]
-        end
-        subgraph APP["Private app subnets — EKS data plane"]
-            ARGO["Argo CD (in-cluster)"]
-            PODS["Flask API pods<br/>Karpenter: Graviton + Spot"]
-            VPCE["VPC endpoints<br/>ECR, S3, Secrets Manager, logs"]
-        end
-        subgraph DATA["Private data subnets"]
-            PROXY["RDS Proxy<br/>r/w + read-only endpoints"]
-            W["Aurora writer (AZ-a)"]
-            RD["Aurora reader (AZ-b)<br/>failover target"]
-            ST[("Shared storage<br/>6 copies / 3 AZs / KMS")]
-        end
-    end
-
-    ALB --> PODS
-    PODS -- "writes (TLS)" --> PROXY
-    PODS -- "reads (TLS)" --> PROXY
-    PROXY -- "writes" --> W
-    PROXY -- "reads" --> RD
-    W --- ST
-    RD --- ST
-
-    DEV["Developer"] -- "push" --> GH["GitHub<br/>app + manifests repos"]
-    GH -- "triggers" --> GHA["GitHub Actions<br/>build, test, scan"]
-    GHA -- "push multi-arch image" --> ECR["ECR<br/>scan-on-push, immutable tags"]
-    GHA -- "commit new tag to manifests" --> GH
-    ARGO -- "pull desired state" --> GH
-    ARGO -- "sync" --> PODS
-    PODS -. "pull images via VPC endpoint" .-> ECR
-```
+[draw.io](https://app.diagrams.net) to edit.)*
 
 Key properties the diagram encodes deliberately:
 
