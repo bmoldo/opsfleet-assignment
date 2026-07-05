@@ -119,12 +119,22 @@ make apply ENV=dev CONCURRENT=1   # run BOTH architectures at the same time
 make apply ENV=dev                # omit OS/CONCURRENT to remove the demo workload
 ```
 
+When done, the developer cleans up after themselves without touching the
+cluster (Karpenter then scales the Spot nodes back down automatically):
+
+```bash
+make destroy-demo ENV=dev         # remove the demo workload (all architectures)
+make destroy-demo ENV=dev OS=arm  # remove only the arm64 demo Deployment
+```
+
 `plan` / `apply` / `destroy` **require you to be authenticated to the AWS CLI** —
 the Makefile checks with `aws sts get-caller-identity` and stops early with a
 clear message if you're not.
 
-Available targets: `init`, `plan`, `apply`, `destroy`, `kubeconfig`, `output`,
-`fmt`, `validate`. Run `make help` for the list.
+Available targets: `init`, `plan`, `apply`, `destroy`, `destroy-demo`,
+`kubeconfig`, `output`, `fmt`, `validate`. Run `make help` for the list.
+`destroy-demo` removes only the demo workload the developer deployed;
+`destroy` tears down the entire environment.
 
 <details>
 <summary>Prefer raw Terraform? Same thing underneath.</summary>
@@ -243,7 +253,7 @@ ENIs can block VPC deletion):
 
 ```bash
 kubectl delete -f examples/           # Karpenter scales its nodes back to zero
-make apply ENV=dev                    # no OS/CONCURRENT ⇒ removes the make-managed demo workload
+make destroy-demo ENV=dev             # removes the make-managed demo workload
 sleep 60                              # give it a moment to terminate instances
 make destroy ENV=dev
 ```
