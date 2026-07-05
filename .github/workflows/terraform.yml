@@ -1,0 +1,89 @@
+# CI/CD for the terraform/ POC.
+#
+# - Every PR and push touching terraform/**: fmt check + validate (no AWS needed).
+# - PRs additionally get a `terraform plan` for dev, posted to the job log.
+# - Push to master: auto-deploys to dev via `make apply ENV=dev`.
+#
+# AWS auth is GitHub OIDC (no long-lived keys). The plan/deploy jobs are
+# skipped until the one-time bootstrap is done and the AWS_ROLE_ARN repository
+# variable is set — see terraform/README.md § "CI/CD: auto-deploy to dev".
+name: terraform
+
+on:
+  pull_request:
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches: [master]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+
+permissions:
+  id-token: write # OIDC token for aws-actions/configure-aws-credentials
+  contents: read
+
+# Never run two applies (or an apply and a plan) against dev concurrently.
+concurrency:
+  group: terraform-dev
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.2"
+          terraform_wrapper: false
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff
+      - name: terraform validate
+        run: make validate
+
+  plan:
+    if: github.event_name == 'pull_request' && vars.AWS_ROLE_ARN != ''
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.2"
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: terraform plan (dev)
+        run: make plan ENV=dev
+
+  deploy-dev:
+    if: github.event_name == 'push' && vars.AWS_ROLE_ARN != ''
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.11.2"
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: terraform apply (dev)
+        run: make apply ENV=dev
+        env:
+          TF_CLI_ARGS_apply: "-auto-approve"

@@ -260,6 +260,94 @@ make destroy ENV=dev
 
 ---
 
+## CI/CD: auto-deploy to dev
+
+[`.github/workflows/terraform.yml`](../.github/workflows/terraform.yml) wires
+the module changes in this directory into GitHub Actions:
+
+| Event                          | What runs                                              |
+| ------------------------------ | ------------------------------------------------------ |
+| PR / push touching `terraform/**` | `terraform fmt -check` + `make validate` (no AWS)   |
+| PR (once OIDC is bootstrapped) | `make plan ENV=dev` — review the diff in the job log   |
+| Push to `master`               | `make apply ENV=dev` — **auto-deploys to dev**         |
+
+Auth uses **GitHub OIDC** (short-lived credentials, no stored keys). The
+plan/deploy jobs **skip themselves until the `AWS_ROLE_ARN` repository
+variable exists**, so merging the workflow is safe before any AWS setup.
+A `concurrency` group serializes runs so two applies can never race, and
+`environment: dev` lets you add required reviewers later if dev stops being
+auto-deploy.
+
+### One-time bootstrap (DevOps-owned, not Terraform-managed)
+
+Like the Spot service-linked role, this is account-level setup that the
+per-env Terraform deliberately doesn't own:
+
+1. **Remote state (required before the first CI apply).** CI runners don't
+   share your laptop's local state — without this, CI would try to create a
+   second copy of everything. Add an S3 backend and migrate:
+
+   ```hcl
+   # backend.tf
+   terraform {
+     backend "s3" {
+       bucket       = "<your-tf-state-bucket>"   # create once, with versioning
+       key          = "opsfleet-poc/terraform.tfstate"
+       region       = "us-east-1"
+       use_lockfile = true   # native S3 locking (Terraform >= 1.10)
+     }
+   }
+   ```
+
+   ```bash
+   terraform init -migrate-state   # moves local workspace states into S3
+   ```
+
+2. **GitHub OIDC provider + deploy role** (once per account):
+
+   ```bash
+   aws iam create-open-id-connect-provider \
+     --url https://token.actions.githubusercontent.com \
+     --client-id-list sts.amazonaws.com
+
+   aws iam create-role --role-name github-actions-terraform-dev \
+     --assume-role-policy-document file://trust.json
+   aws iam attach-role-policy --role-name github-actions-terraform-dev \
+     --policy-arn arn:aws:iam::aws:policy/AdministratorAccess   # POC; scope down for real use
+   ```
+
+   `trust.json` — locked to this repo, and applies only from `master`:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
+       "Action": "sts:AssumeRoleWithWebIdentity",
+       "Condition": {
+         "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+         "StringLike": { "token.actions.githubusercontent.com:sub": [
+           "repo:bmoldo/opsfleet-assignment:ref:refs/heads/master",
+           "repo:bmoldo/opsfleet-assignment:pull_request"
+         ] }
+       }
+     }]
+   }
+   ```
+
+3. **Point the workflow at the role** — repo → Settings → Secrets and
+   variables → Actions → Variables:
+
+   ```
+   AWS_ROLE_ARN = arn:aws:iam::<ACCOUNT_ID>:role/github-actions-terraform-dev
+   ```
+
+From then on: edit/add/remove modules under `terraform/`, open a PR (plan
+shows up in the checks), merge to `master` — dev updates itself.
+
+---
+
 ## Production hardening (intentionally out of scope for this POC)
 
 - **State:** the Makefile uses **workspaces over local state** for simple per-env
