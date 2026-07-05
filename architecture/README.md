@@ -20,6 +20,9 @@ data), cost-effective, managed Kubernetes, CI/CD.
 9. [Cost optimization](#9-cost-optimization)
 10. [Observability & operations](#10-observability--operations)
 11. [Growth path: a few hundred → millions of users](#11-growth-path-a-few-hundred--millions-of-users)
+12. [Design reasoning — why this way](#12-design-reasoning--why-this-way)
+13. [Improvements](#13-improvements)
+14. [Known weaknesses & trade-offs](#14-known-weaknesses--trade-offs)
 
 ---
 
@@ -412,3 +415,182 @@ Developer → GitHub PR → GitHub Actions
 account, network, EKS/Karpenter, and Aurora foundations were chosen precisely so
 that growth is a matter of turning dials (replicas, regions, readers), not
 re-architecting.
+
+---
+
+## 12. Design reasoning — why this way
+
+The recurring pattern in every decision below: name the alternative that was
+consciously rejected, and the condition under which the decision would flip.
+
+**Why Kubernetes at all, at a few hundred users/day?**
+It is genuinely more platform than launch traffic needs — ECS Fargate or App
+Runner would be simpler and cheaper for year one. EKS is chosen because (a)
+managed Kubernetes is an explicit requirement, (b) the growth target is
+millions of users and an ECS→EKS migration mid-growth is a real project,
+whereas here the launch design and the scale design are the same design, and
+(c) Kubernetes manifests, Helm charts, and the GitOps flow are portable and
+hireable. Flip condition: if the Kubernetes requirement were dropped and the
+scale ambition softened, ECS Fargate wins on cost and simplicity.
+
+**Why Aurora rather than RDS PostgreSQL, given the low initial load?**
+The launch configuration is **Aurora Serverless v2** (0.5 ACU floor, auto-pause
+to zero ACUs when idle), which removes most of the cost objection: capacity is
+paid as consumed and the same cluster later grows into provisioned instances
+plus up to 15 readers with no migration. The reason Aurora over RDS at target
+scale is the replication mechanism, not the replica count (both allow 15):
+Aurora readers share the storage volume (ms-level lag, nothing to break),
+failover is sub-30s, storage grows itself, and Global Database covers
+multi-region DR. Flip condition: if absolute launch cost outranked the growth
+profile, RDS PostgreSQL Multi-AZ is the named cheaper start with an upgrade
+path.
+
+**Why Spot for an API that handles sensitive data?**
+Data sensitivity and capacity volatility are orthogonal — Spot changes
+availability mechanics, not the security posture. Mitigations are layered: the
+API is stateless, AWS gives a 2-minute interruption notice, Karpenter drains
+and pre-provisions replacements, PDBs enforce a minimum replica count, topology
+spread keeps replicas across AZs, and the NodePool falls back to on-demand.
+Honest caveat: at a 2–3 pod launch fleet the absolute savings are small, so the
+first replicas can run on-demand and Spot-first is enabled once the fleet is
+large enough for interruptions to be statistically boring — a NodePool weight
+change, not a redesign.
+
+**Why six accounts for a small team?**
+Control Tower vends accounts from Account Factory in minutes with guardrails
+pre-attached, so the marginal cost of an account is near zero — and an account
+is AWS's only hard security, quota, and billing boundary. Namespaces are a
+scheduling boundary, not a security boundary. The four non-workload accounts
+are set-and-forget. Minimum viable fallback: three accounts (management + dev +
+prod), growing the OU structure later.
+
+**Why three AZs instead of two?**
+Aurora replicates storage across three AZs regardless, so the data tier is 3-AZ
+by construction. For compute, losing one of two AZs removes 50% of capacity vs.
+33% of three, and quorum-based systems added later want three failure domains.
+The real delta is one extra NAT gateway (~$33/mo) — negligible against the
+availability math.
+
+**Why Karpenter instead of Cluster Autoscaler?**
+Cluster Autoscaler scales pre-guessed node groups, takes minutes (ASG
+round-trips), and bin-packs poorly. Karpenter provisions from the pending-pod
+spec directly: right-sized instances from a wide Spot/on-demand/arm64/x86 pool
+in tens of seconds, plus consolidation that actively repacks and removes idle
+nodes — where the real savings live. Cost: one more controller, and its
+consolidation churn requires disciplined PDBs (mandated here anyway). The
+static on-demand system group hosting Karpenter itself removes the
+chicken-and-egg problem.
+
+**Why pull-based GitOps instead of deploying from CI?**
+Push-from-CI parks cluster-admin credentials in a third-party SaaS and lets
+cluster state drift silently between deploys. Pull-based inverts it: the
+cluster reaches out to Git, CI's blast radius ends at the repo, drift is
+continuously reconciled, and rollback is `git revert`. Argo CD over Flux is a
+soft preference (UI visibility for a small team, Argo Rollouts for canary) —
+Flux would be an equally defensible pick.
+
+**Why an ALB via the AWS Load Balancer Controller rather than NGINX ingress?**
+ACM-managed TLS, a WAF attachment point, target groups bound directly to pod
+IPs (no NodePort hop), and one less data-plane component to patch and scale.
+NGINX buys portability and richer L7 features at the cost of operating the
+proxy. Gateway API is the expected successor and the controller already
+supports it; adoption is planned as the standard matures.
+
+**Why CloudFront in front of a dynamic API?**
+Only partly about caching: TLS termination near the user plus connection reuse
+over the AWS backbone improves p95 for a geographically spread user base;
+WAF/Shield enforce at the edge before traffic touches the VPC; and serving the
+SPA and `/api/*` from one distribution gives a single origin — no CORS.
+Combined with the CloudFront prefix-list security group (plus a verified custom
+origin header, since the prefix list covers all CloudFront customers, not just
+ours), the edge cannot be bypassed.
+
+**Why RDS Proxy from day one?**
+Karpenter and HPA mean pods — and their connection pools — churn constantly,
+and PostgreSQL connections are expensive processes: a scale-out spike can
+exhaust `max_connections` on a small instance in seconds. The proxy multiplexes
+connections and holds clients through failover, shaving promotion time. It
+could be deferred at a 3-pod launch, but it costs ~$22/mo and one Terraform
+module, and retrofitting the connection layer during a traffic spike is the
+worst possible time.
+
+**Why Secrets Manager and not Vault?**
+Vault is a product to operate; Secrets Manager is a line of Terraform with
+native rotation and RDS Proxy integration. Delivery into pods: External
+Secrets Operator syncs entries into Kubernetes secrets, and Pod Identity/IRSA
+authorizes each workload to read only its own. Same managed-first principle as
+everywhere else.
+
+---
+
+## 13. Improvements
+
+Prioritized roadmap — each is additive, none requires re-architecting:
+
+1. **Aurora Serverless v2 with auto-pause at launch** — best cost-to-effort
+   improvement; zero architectural change, the cluster grows into provisioned
+   capacity later.
+2. **PR preview environments** — Argo CD ApplicationSets spin an ephemeral
+   namespace per pull request in the Dev account; large DX win for a team
+   shipping continuously.
+3. **ElastiCache (Redis/Valkey)** at the traction stage — token/session cache
+   and hot-read offload before adding Aurora readers; cheaper than scaling the
+   database.
+4. **Policy-as-code** — Kyverno in-cluster (verify image signatures, disallow
+   `latest`, enforce requests/limits) and OPA/Conftest against Terraform plans
+   in CI.
+5. **AWS Backup with a cross-account vault** — backup copies land in an account
+   the workload account cannot delete from; the ransomware answer and a
+   compliance win.
+6. **Chaos and DR validation** — AWS Fault Injection Service to kill an AZ and
+   a writer on a schedule; an untested failover claim is a hope, not a
+   capability.
+7. **Load testing** the scaling claims (k6/Locust against a prod-like
+   environment) so HPA thresholds and Karpenter limits are tuned on data.
+8. **IPv6 / VPC CNI prefix delegation** — removes pod-density IP pressure
+   before it exists.
+9. **Multi-region active-passive → active-active** at the 1M+ stage — Global
+   Database plus Route 53 failover records first; full active-active only if a
+   latency SLA or regulatory driver justifies doubling the complexity.
+
+Deliberate non-improvements — considered and rejected for now:
+
+- **Service mesh** — TLS end-to-end plus NetworkPolicies cover the current
+  security need; Istio/Linkerd's operational tax is not justified until there
+  are enough services to need traffic management between them.
+- **Multi-cluster** — one cluster per environment until blast radius or scale
+  forces sharding.
+- **Self-hosted observability** — managed Prometheus/Grafana until the cost
+  curves cross.
+
+---
+
+## 14. Known weaknesses & trade-offs
+
+Owned openly — every architecture has them; these are the conscious ones:
+
+- **Operational complexity vs. team size.** EKS + Karpenter + Argo CD +
+  multi-account is a platform, and a very small team will feel it. The
+  mitigation is that every component is managed or declarative — but this is
+  the single biggest risk of the design, and the ECS-shaped alternative is
+  acknowledged in §12.
+- **Platform overhead dominates launch cost.** At day-one traffic, NAT gateways
+  (~$100/mo) and the EKS control plane ($73/mo) cost more than the compute
+  actually serving users (prod ballpark: ~$380–600/mo all-in). That is the
+  price of the "no redesign at scale" guarantee, and why non-prod runs a single
+  NAT.
+- **Staging is a namespace before it is an account.** Until the Staging account
+  exists (§4), "staging" in the CI/CD flow is a Kustomize overlay in the Dev
+  account — a weaker isolation guarantee, promoted to a full account when
+  release risk justifies a prod mirror.
+- **Serverless v2 auto-pause cold starts.** Resume takes roughly 15 seconds —
+  acceptable in dev; in prod the minimum stays at 0.5 ACU instead of pausing.
+- **Spot economics at a tiny fleet.** With 2–3 replicas the savings are small
+  and each interruption is proportionally larger; hence the on-demand-first
+  launch stance in §12.
+- **Single-region application tier.** The DR table covers region loss for the
+  database, but the app tier's regional failover is "deploy the GitOps repo to
+  a second cluster" — a runbook, not a button, until improvement #9 lands.
+- **Untested failure claims.** Failover timings (<30 s, <1 min) are AWS's
+  numbers, not ours, until the FIS/chaos validation in §13 runs against this
+  actual stack.
